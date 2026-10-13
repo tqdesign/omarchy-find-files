@@ -1,0 +1,16 @@
+#!/bin/bash
+# Show a file in the file manager with it selected. Falls back to opening the
+# containing folder when no file manager answers the FileManager1 call.
+
+set -u
+
+path=${1:-}
+[[ -e $path ]] || exit 1
+
+uri=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).as_uri())' "$path")
+
+gdbus call --session --timeout 3 \
+  --dest org.freedesktop.FileManager1 \
+  --object-path /org/freedesktop/FileManager1 \
+  --method org.freedesktop.FileManager1.ShowItems "['$uri']" "" >/dev/null 2>&1 ||
+  xdg-open "$(dirname "$path")"

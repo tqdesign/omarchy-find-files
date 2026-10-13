@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Search file names for Overlay.qml and print one JSON object.
+
+  find-files-search <relevance|name|modified|size> <query>
+
+The query is split on spaces and every term must match. A term matches the
+file name, or the whole path when any term contains a slash. Terms with
+* ? [ are globs against the whole name; anything else is a substring. Case is
+ignored.
+
+plocate answers from its index in milliseconds, but the index is only as
+fresh as the last updatedb (daily by default). So fd also scans the home
+folder for files changed since then, and the two lists are merged.
+"""
+
+import fnmatch
+import json
+import os
+import stat
+import subprocess
+import sys
+
+DB = "/var/lib/plocate/plocate.db"
+FETCH = 3000  # matches taken from the index before ranking
+FRESH = 500  # newer-than-index matches taken from fd
+SHOW = 300  # rows handed to the overlay
+GLOB_CHARS = set("*?[")
+# Not worth walking for new files; updatedb skips .git too.
+FD_EXCLUDES = [".git", "node_modules", ".cache"]
+HOME = os.path.expanduser("~")
+
+
+def is_glob(term):
+    return any(char in GLOB_CHARS for char in term)
+
+
+def longest_literal(terms):
+    """The longest glob-free piece of any term, to narrow fd's own walk."""
+    best = ""
+    for term in terms:
+        piece = ""
+        for char in term + "*":
+            if char in GLOB_CHARS:
+                best = max(best, piece, key=len)
+                piece = ""
+            else:
+                piece += char
+    return best
+
+
+def matches(path, terms, whole):
+    target = (path if whole else os.path.basename(path)).lower()
+    for term in terms:
+        if is_glob(term):
+            if not fnmatch.fnmatchcase(target, term):
+                return False
+        elif term not in target:
+            return False
+    return True
+
+
+def index_mtime():
+    try:
+        return os.stat(DB).st_mtime
+    except OSError:
+        return 0
+
+
+def start_plocate(terms, whole):
+    command = ["plocate", "-i", "-0", "-l", str(FETCH)]
+    if not whole:
+        command.append("-b")
+    return subprocess.Popen(command + ["--"] + terms, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def start_fd(terms, whole, since):
+    needle = longest_literal(terms)
+    if not needle or not since:
+        return None
+    command = ["fd", "-H", "-I", "-a", "-0", "-i", "-F", "--changed-after", f"@{int(since)}"]
+    # A one-letter needle matches most of the tree; stop once there is plenty.
+    command += ["--max-results", str(FRESH)]
+    if whole:
+        command.append("-p")
+    for name in FD_EXCLUDES:
+        command += ["-E", name]
+    try:
+        return subprocess.Popen(command + ["--", needle, HOME], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def read_paths(process):
+    if process is None:
+        return []
+    out, _ = process.communicate()
+    return [os.fsdecode(raw).rstrip("/") or "/" for raw in out.split(b"\0") if raw]
+
+
+def relevance(row, terms):
+    path = row["p"]
+    base = os.path.basename(path).lower()
+    if base == " ".join(terms):
+        tier = 0
+    elif base.startswith(terms[0]):
+        tier = 1
+    else:
+        tier = 2
+    hidden = any(part.startswith(".") for part in path.split("/"))
+    outside_home = not path.startswith(HOME + "/")
+    return (tier, hidden, outside_home, path.count("/"), len(base), path)
+
+
+def main():
+    order = sys.argv[1] if len(sys.argv) > 1 else "relevance"
+    query = sys.argv[2] if len(sys.argv) > 2 else ""
+    terms = [os.path.expanduser(term).lower() for term in query.split()]
+    since = index_mtime()
+    result = {"query": query, "order": order, "indexed": since, "rows": [], "total": 0, "capped": False}
+    # plocate's index is built on three-letter runs. A lone letter makes it
+    # read every name on the disk (about a second here), so wait for more.
+    result["short"] = bool(terms) and len(longest_literal(terms)) < 2
+
+    if terms and not result["short"]:
+        whole = any("/" in term for term in terms)
+        plocate = start_plocate(terms, whole)
+        fd = start_fd(terms, whole, since)
+        indexed = read_paths(plocate)
+        fresh = [path for path in read_paths(fd) if matches(path, terms, whole)]
+        result["capped"] = len(indexed) >= FETCH
+
+        rows = []
+        seen = set()
+        for path in fresh + indexed:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                info = os.stat(path)
+            except OSError:
+                try:
+                    info = os.lstat(path)
+                except OSError:
+                    # Deleted since the index was built.
+                    continue
+            is_dir = stat.S_ISDIR(info.st_mode)
+            rows.append({"p": path, "s": 0 if is_dir else info.st_size, "m": int(info.st_mtime), "d": is_dir})
+
+        if order == "name":
+            rows.sort(key=lambda row: (os.path.basename(row["p"]).lower(), row["p"]))
+        elif order == "modified":
+            rows.sort(key=lambda row: -row["m"])
+        elif order == "size":
+            rows.sort(key=lambda row: (row["d"], -row["s"]))
+        else:
+            rows.sort(key=lambda row: relevance(row, terms))
+
+        result["total"] = len(rows)
+        result["rows"] = rows[:SHOW]
+
+    json.dump(result, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

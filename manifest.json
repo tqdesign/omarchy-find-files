@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "tqdesign.find-files",
+  "name": "Find Files",
+  "version": "1.0.0",
+  "author": "tqdesign",
+  "license": "MIT",
+  "description": "Find any file on the disk by name as you type, like Everything on Windows. Backed by the plocate index.",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Overlay.qml"
+  }
+}
