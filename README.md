@@ -7,8 +7,9 @@ Find any file on the disk by name as you type, like
 - Answers from the `plocate` index, so a whole-disk search takes milliseconds.
 - Also scans your home folder for files newer than the index, so something you
   saved a minute ago still shows up.
-- Shows name, folder, size and modified date; sorts by relevance, name, date or
-  size.
+- Shows name, folder, size and modified date, with the matching letters
+  highlighted; sorts by relevance, name, date or size.
+- Filters by extension, size, date and kind.
 
 ## Searching
 
@@ -18,6 +19,25 @@ Find any file on the disk by name as you type, like
 | `report 2026` | Names containing both words |
 | `*.pdf invoice` | PDFs with "invoice" in the name; `*` and `?` are wildcards |
 | `projects/ readme` | "readme" where the path contains "projects/" |
+| `ext:mp4 size:>100mb` | Videos over 100 MB |
+| `ext:jpg,png holiday` | JPEGs and PNGs with "holiday" in the name |
+| `modified:today` | Everything changed today in your home folder |
+| `report modified:week` | "report" files changed in the last 7 days |
+| `report folder:` | Folders only; `file:` for files only |
+
+Filters:
+
+| Filter | Values |
+| --- | --- |
+| `ext:` | One extension or a comma-separated list |
+| `size:` | `>`, `<`, `>=` or `<=`, a number, and `b`, `kb`, `mb` or `gb` |
+| `modified:` | `today`, `yesterday`, `week`, `month`, `year`, or a count such as `7d` or `12h`. Put `>` in front for "longer ago than", as in `modified:>30d` |
+| `file:` `folder:` | Only files, or only folders |
+
+A date filter with no name, such as `modified:today`, lists the home folder
+only: the index holds names, not dates, so there is nothing to ask it.
+
+The Trash is always left out of the results.
 
 Searching starts at the second character. One letter would make `plocate` read
 every name on the disk, which takes about a second.
@@ -30,6 +50,8 @@ every name on the disk, which takes about a second.
 | `Ctrl+Enter` | Show it in the file manager |
 | `Ctrl+C` | Copy its full path |
 | `Ctrl+S` | Cycle the sort: relevance, name, modified, size |
+| `Ctrl+H` | Switch between the whole disk and the home folder only |
+| `Ctrl+F` | Cycle between everything, files only and folders only |
 | `Up` `Down` `PgUp` `PgDn` | Move the selection |
 | `Ctrl+Backspace`, `Ctrl+U` | Delete a word, clear the box |
 | `Esc` | Clear the box, then close |
@@ -69,7 +91,7 @@ To rebuild now, run `sudo updatedb`. To rebuild more often, give
 ## Limits
 
 - At most 3,000 index matches are ranked and 300 shown; narrow the search if
-  the footer says "Over 3,000".
+  the footer says "Over". The home-only search takes a wider net of 30,000.
 - `updatedb` skips `/tmp`, `/mnt`, `/media` and network mounts by default; see
   `/etc/updatedb.conf`.
 

@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """Search file names for Overlay.qml and print one JSON object.
 
-  find-files-search <relevance|name|modified|size> <query>
+  find-files-search <relevance|name|modified|size> <disk|home> <all|files|folders> <query>
 
-The query is split on spaces and every term must match. A term matches the
-file name, or the whole path when any term contains a slash. Terms with
+The query is split on spaces and every word must match. A word matches the
+file name, or the whole path when any word contains a slash. Words with
 * ? [ are globs against the whole name; anything else is a substring. Case is
 ignored.
+
+Words of the form key:value are filters instead:
+  ext:pdf  ext:jpg,png        file extension
+  size:>100mb  size:<4kb      file size (b, kb, mb, gb)
+  modified:today  yesterday  week  month  year  7d  12h   changed within
+  modified:>30d               changed longer ago than
+  file:  folder:              only files, only folders
 
 plocate answers from its index in milliseconds, but the index is only as
 fresh as the last updatedb (daily by default). So fd also scans the home
@@ -16,36 +23,42 @@ folder for files changed since then, and the two lists are merged.
 import fnmatch
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
+import time
 
 DB = "/var/lib/plocate/plocate.db"
 FETCH = 3000  # matches taken from the index before ranking
+# The index can't be asked for "under home" or "name only" at once, so that
+# search takes a wider net and is narrowed here.
+FETCH_HOME = 30000
 FRESH = 500  # newer-than-index matches taken from fd
 SHOW = 300  # rows handed to the overlay
 GLOB_CHARS = set("*?[")
 # Not worth walking for new files; updatedb skips .git too.
 FD_EXCLUDES = [".git", "node_modules", ".cache"]
 HOME = os.path.expanduser("~")
+TRASH = ("/.local/share/Trash/", "/.Trash-", "/.Trash/")
+SIZE_UNITS = {"": 1, "b": 1, "k": 1024, "kb": 1024, "m": 1024**2, "mb": 1024**2, "g": 1024**3, "gb": 1024**3}
+SPANS = {"week": 7 * 86400, "month": 30 * 86400, "year": 365 * 86400}
 
 
 def is_glob(term):
     return any(char in GLOB_CHARS for char in term)
 
 
-def longest_literal(terms):
-    """The longest glob-free piece of any term, to narrow fd's own walk."""
-    best = ""
+def literal_pieces(terms):
+    """The glob-free pieces of the terms."""
+    pieces = []
     for term in terms:
-        piece = ""
-        for char in term + "*":
-            if char in GLOB_CHARS:
-                best = max(best, piece, key=len)
-                piece = ""
-            else:
-                piece += char
-    return best
+        pieces += [piece for piece in re.split(r"[*?\[\]]+", term) if piece]
+    return pieces
+
+
+def longest_literal(terms):
+    return max(literal_pieces(terms), key=len, default="")
 
 
 def matches(path, terms, whole):
@@ -59,6 +72,84 @@ def matches(path, terms, whole):
     return True
 
 
+def parse_size(value):
+    found = re.fullmatch(r"(>=|<=|>|<)?(\d+(?:\.\d+)?)([a-z]*)", value)
+    if not found or found.group(3) not in SIZE_UNITS:
+        return None
+    limit = float(found.group(2)) * SIZE_UNITS[found.group(3)]
+    return (found.group(1) or ">=", limit)
+
+
+def parse_modified(value, now):
+    """(must be older than, must be newer than) as timestamps; None is open."""
+    older = value.startswith(">")
+    value = value.lstrip("<>")
+    midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
+    if value == "today":
+        span_start = midnight
+    elif value == "yesterday":
+        if older:
+            return (midnight - 86400, None)
+        return (midnight, midnight - 86400)
+    elif value in SPANS:
+        span_start = now - SPANS[value]
+    else:
+        found = re.fullmatch(r"(\d+)([dh])", value)
+        if not found:
+            return None
+        span_start = now - int(found.group(1)) * (86400 if found.group(2) == "d" else 3600)
+    return (span_start, None) if older else (None, span_start)
+
+
+def parse_query(query, kind, now):
+    """Split the query into name terms and filters."""
+    spec = {"terms": [], "exts": [], "size": None, "modified": None, "kind": kind, "ignored": []}
+    for word in query.split():
+        lower = word.lower()
+        key, colon, value = lower.partition(":")
+        if colon and key in ("file", "files") and not value:
+            spec["kind"] = "files"
+        elif colon and key in ("folder", "folders", "dir") and not value:
+            spec["kind"] = "folders"
+        elif colon and key == "ext" and value:
+            spec["exts"] += ["." + ext.lstrip(".") for ext in value.split(",") if ext.strip(".")]
+        elif colon and key == "size" and value:
+            spec["size"] = parse_size(value)
+            if spec["size"] is None:
+                spec["ignored"].append(word)
+        elif colon and key in ("modified", "mod") and value:
+            spec["modified"] = parse_modified(value, now)
+            if spec["modified"] is None:
+                spec["ignored"].append(word)
+        else:
+            spec["terms"].append(os.path.expanduser(word).lower())
+    return spec
+
+
+def passes(row, spec):
+    path, is_dir = row["p"], row["d"]
+    if spec["kind"] == "files" and is_dir:
+        return False
+    if spec["kind"] == "folders" and not is_dir:
+        return False
+    if spec["exts"] and not path.lower().endswith(tuple(spec["exts"])):
+        return False
+    if spec["size"]:
+        if is_dir:
+            return False
+        operator, limit = spec["size"]
+        size = row["s"]
+        if not {">": size > limit, ">=": size >= limit, "<": size < limit, "<=": size <= limit}[operator]:
+            return False
+    if spec["modified"]:
+        before, after = spec["modified"]
+        if before is not None and row["m"] >= before:
+            return False
+        if after is not None and row["m"] < after:
+            return False
+    return True
+
+
 def index_mtime():
     try:
         return os.stat(DB).st_mtime
@@ -66,26 +157,27 @@ def index_mtime():
         return 0
 
 
-def start_plocate(terms, whole):
-    command = ["plocate", "-i", "-0", "-l", str(FETCH)]
+def start_plocate(patterns, whole, limit):
+    command = ["plocate", "-i", "-0", "-l", str(limit)]
     if not whole:
         command.append("-b")
-    return subprocess.Popen(command + ["--"] + terms, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return subprocess.Popen(command + ["--"] + patterns, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
-def start_fd(terms, whole, since):
-    needle = longest_literal(terms)
-    if not needle or not since:
+def start_fd(needle, whole, since, limit):
+    if not since:
         return None
-    command = ["fd", "-H", "-I", "-a", "-0", "-i", "-F", "--changed-after", f"@{int(since)}"]
+    command = ["fd", "-H", "-I", "-a", "-0", "-i", "--changed-after", f"@{int(since)}"]
     # A one-letter needle matches most of the tree; stop once there is plenty.
-    command += ["--max-results", str(FRESH)]
+    command += ["--max-results", str(limit)]
     if whole:
         command.append("-p")
     for name in FD_EXCLUDES:
         command += ["-E", name]
+    # No needle lists everything changed since then.
+    command += ["-F", "--", needle] if needle else ["--", "."]
     try:
-        return subprocess.Popen(command + ["--", needle, HOME], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return subprocess.Popen(command + [HOME], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
         return None
 
@@ -100,9 +192,9 @@ def read_paths(process):
 def relevance(row, terms):
     path = row["p"]
     base = os.path.basename(path).lower()
-    if base == " ".join(terms):
+    if terms and base == " ".join(terms):
         tier = 0
-    elif base.startswith(terms[0]):
+    elif terms and base.startswith(terms[0]):
         tier = 1
     else:
         tier = 2
@@ -112,52 +204,91 @@ def relevance(row, terms):
 
 
 def main():
-    order = sys.argv[1] if len(sys.argv) > 1 else "relevance"
-    query = sys.argv[2] if len(sys.argv) > 2 else ""
-    terms = [os.path.expanduser(term).lower() for term in query.split()]
+    given = sys.argv[1:5]
+    order, scope, kind, query = given + ["relevance", "disk", "all", ""][len(given):]
+    now = time.time()
     since = index_mtime()
-    result = {"query": query, "order": order, "indexed": since, "rows": [], "total": 0, "capped": False}
-    # plocate's index is built on three-letter runs. A lone letter makes it
-    # read every name on the disk (about a second here), so wait for more.
-    result["short"] = bool(terms) and len(longest_literal(terms)) < 2
+    spec = parse_query(query, kind, now)
+    terms = spec["terms"]
+    whole = any("/" in term for term in terms)
+    needles = {piece for term in terms for piece in literal_pieces(term.split("/")) if piece != "~"}
+    result = {
+        "query": query, "order": order, "scope": scope, "kind": kind,
+        "indexed": since, "rows": [], "total": 0, "capped": False, "short": False,
+        "ignored": spec["ignored"],
+        # What the overlay marks in each row, longest first.
+        "needles": sorted(needles, key=len, reverse=True),
+        "whole": whole,
+    }
 
-    if terms and not result["short"]:
-        whole = any("/" in term for term in terms)
-        plocate = start_plocate(terms, whole)
-        fd = start_fd(terms, whole, since)
-        indexed = read_paths(plocate)
-        fresh = [path for path in read_paths(fd) if matches(path, terms, whole)]
-        result["capped"] = len(indexed) >= FETCH
+    # One extension can be asked of the index directly, as a glob.
+    ext_globs = ["*" + spec["exts"][0]] if len(spec["exts"]) == 1 else []
+    patterns = terms + ext_globs
+    newer_than = spec["modified"][1] if spec["modified"] else None
 
-        rows = []
-        seen = set()
-        for path in fresh + indexed:
-            if path in seen:
-                continue
-            seen.add(path)
-            try:
-                info = os.stat(path)
-            except OSError:
-                try:
-                    info = os.lstat(path)
-                except OSError:
-                    # Deleted since the index was built.
-                    continue
-            is_dir = stat.S_ISDIR(info.st_mode)
-            rows.append({"p": path, "s": 0 if is_dir else info.st_size, "m": int(info.st_mtime), "d": is_dir})
-
-        if order == "name":
-            rows.sort(key=lambda row: (os.path.basename(row["p"]).lower(), row["p"]))
-        elif order == "modified":
-            rows.sort(key=lambda row: -row["m"])
-        elif order == "size":
-            rows.sort(key=lambda row: (row["d"], -row["s"]))
+    plocate = fd = None
+    if len(longest_literal(patterns)) >= 2:
+        if scope == "home":
+            # Whole-path search so the home prefix can be one of the patterns;
+            # the name-only rule is applied to what comes back.
+            limit = FETCH_HOME
+            plocate = start_plocate([HOME + "/"] + patterns, True, limit)
         else:
-            rows.sort(key=lambda row: relevance(row, terms))
+            limit = FETCH
+            plocate = start_plocate(patterns, whole, limit)
+        fd = start_fd(longest_literal(patterns), whole, since, FRESH)
+    elif not patterns and newer_than is not None:
+        # "modified:today" by itself: the index has no dates, so list what
+        # changed in the home folder since then.
+        limit = FETCH
+        fd = start_fd("", False, newer_than, limit)
+    else:
+        # plocate's index is built on three-letter runs. A lone letter makes
+        # it read every name on the disk (about a second here), so wait.
+        result["short"] = bool(query.strip())
+        json.dump(result, sys.stdout)
+        return
 
-        result["total"] = len(rows)
-        result["rows"] = rows[:SHOW]
+    indexed = read_paths(plocate)
+    fresh = read_paths(fd)
+    result["capped"] = len(indexed) >= limit or (plocate is None and len(fresh) >= limit)
 
+    rows = []
+    seen = set()
+    for path in fresh + indexed:
+        if path in seen:
+            continue
+        seen.add(path)
+        if any(marker in path for marker in TRASH):
+            continue
+        if scope == "home" and not path.startswith(HOME + "/"):
+            continue
+        if not matches(path, terms, whole):
+            continue
+        try:
+            info = os.stat(path)
+        except OSError:
+            try:
+                info = os.lstat(path)
+            except OSError:
+                # Deleted since the index was built.
+                continue
+        is_dir = stat.S_ISDIR(info.st_mode)
+        row = {"p": path, "s": 0 if is_dir else info.st_size, "m": int(info.st_mtime), "d": is_dir}
+        if passes(row, spec):
+            rows.append(row)
+
+    if order == "name":
+        rows.sort(key=lambda row: (os.path.basename(row["p"]).lower(), row["p"]))
+    elif order == "modified":
+        rows.sort(key=lambda row: -row["m"])
+    elif order == "size":
+        rows.sort(key=lambda row: (row["d"], -row["s"]))
+    else:
+        rows.sort(key=lambda row: relevance(row, terms))
+
+    result["total"] = len(rows)
+    result["rows"] = rows[:SHOW]
     json.dump(result, sys.stdout)
 
 
