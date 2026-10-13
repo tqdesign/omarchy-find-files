@@ -4,6 +4,8 @@ Find any file on the disk by name as you type, like
 [Everything](https://www.voidtools.com/) on Windows. Built as an
 [Omarchy](https://omarchy.org/) shell plugin for Hyprland.
 
+![Find Files cheat sheet: what to type and which keys to use](docs/cheatsheet.png)
+
 - Answers from the `plocate` index, so a whole-disk search takes milliseconds.
 - Also scans your home folder for files newer than the index, so something you
   saved a minute ago still shows up.
